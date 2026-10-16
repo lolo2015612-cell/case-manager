@@ -1,0 +1,15 @@
+# ملفات تُولَّد تلقائيًا ولا تُرفع إلى GitHub
+node_modules/
+release/
+dist/
+*.log
+
+# بيانات المستخدمين: لا تُرفع أبدًا (حماية للخصوصية)
+app-data*.json
+backup-seed.json
+backups/
+
+# ملفات النظام
+.DS_Store
+Thumbs.db
+*.tmp

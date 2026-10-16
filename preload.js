@@ -1,0 +1,40 @@
+// preload.js
+// بيوصل واجهة window.electronAPI بالتطبيق (index.html) بشكل آمن عبر contextBridge،
+// بنفس أسماء الدوال بالظبط اللي التطبيق مبرمج عليها أصلاً (نفس التوقيعات
+// المستخدمة في النسخة الاحتياطية الخاصة بالمتصفح/الموبايل)، عشان الكود
+// الأساسي في index.html يشتغل من غير أي تعديل.
+
+const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('electronAPI', {
+    saveFile: (args) => ipcRenderer.invoke('saveFile', args),
+    listFiles: (args) => ipcRenderer.invoke('listFiles', args),
+    readFile: (args) => ipcRenderer.invoke('readFile', args),
+    getFileUrl: (args) => ipcRenderer.invoke('getFileUrl', args),
+    deleteFile: (args) => ipcRenderer.invoke('deleteFile', args),
+    downloadFile: (args) => ipcRenderer.invoke('downloadFile', args),
+    openFileNative: (args) => ipcRenderer.invoke('openFileNative', args),
+    openPdfInBrowser: (args) => ipcRenderer.invoke('openPdfInBrowser', args),
+    loadData: () => ipcRenderer.invoke('loadData'),
+    saveData: (args) => ipcRenderer.invoke('saveData', args),
+    chooseStorageFolder: () => ipcRenderer.invoke('chooseStorageFolder'),
+    getStoragePath: () => ipcRenderer.invoke('getStoragePath'),
+    readClipboard: () => ipcRenderer.invoke('readClipboard'),
+    writeClipboard: (args) => ipcRenderer.invoke('writeClipboard', args),
+    scanStorageFolders: () => ipcRenderer.invoke('scanStorageFolders'),
+    importCaseFolder: (args) => ipcRenderer.invoke('importCaseFolder', args),
+    exportHtmlToPdf: (args) => ipcRenderer.invoke('exportHtmlToPdf', args),
+    readTemplate: (args) => ipcRenderer.invoke('readTemplate', args),
+    letterDraftWrite: (args) => ipcRenderer.invoke('letterDraftWrite', args),
+    letterDraftOpen: (args) => ipcRenderer.invoke('letterDraftOpen', args),
+    letterDraftRead: (args) => ipcRenderer.invoke('letterDraftRead', args),
+    letterDraftSaveAs: (args) => ipcRenderer.invoke('letterDraftSaveAs', args),
+    createBackup: (args) => ipcRenderer.invoke('createBackup', args),
+    listBackups: () => ipcRenderer.invoke('listBackups'),
+    readBackup: (args) => ipcRenderer.invoke('readBackup', args),
+    openBackupsFolder: () => ipcRenderer.invoke('openBackupsFolder')
+
+    // ملحوظة: تعمدنا عدم إضافة saveData/loadData هنا. بيانات القضايا والأحكام
+    // بتفضل بتتزامن حصريًا عبر Firebase (بنفس طريقة الموبايل بالظبط)، وده اللي
+    // بيخلي نسخة اللاب توب مرتبطة ببيانات الموبايل تلقائيًا بدون أي فرق.
+});

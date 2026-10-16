@@ -1,0 +1,59 @@
+{
+  "name": "case-manager-standalone",
+  "productName": "نظام إدارة القضايا - نسخة مستقلة",
+  "version": "1.0.0",
+  "description": "نظام إدارة القضايا - نسخة مستقلة بدون اتصال بقواعد بيانات سحابية",
+  "main": "main.js",
+  "author": "المستشار محمود العوابدي",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win",
+    "dist:dir": "electron-builder --win --dir",
+    "predist": "node scripts/prepare-letters.js",
+    "predist:dir": "node scripts/prepare-letters.js"
+  },
+  "devDependencies": {
+    "electron": "^31.3.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "eg.stateslawsuits.casemanager.standalone",
+    "productName": "نظام إدارة القضايا - نسخة مستقلة",
+    "files": [
+      "main.js",
+      "preload.js",
+      "app/**/*",
+      "build/icon.png",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "نظام إدارة القضايا",
+      "uninstallDisplayName": "نظام إدارة القضايا - نسخة مستقلة",
+      "artifactName": "Setup-CaseManager-Standalone-${version}.${ext}",
+      "deleteAppDataOnUninstall": false
+    },
+    "asarUnpack": [
+      "app/templates/**/*"
+    ]
+  }
+}

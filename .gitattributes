@@ -1,0 +1,9 @@
+# ملفات التشغيل على Windows تبقى بنهاية أسطر Windows حتى لا تتعطل بعد التنزيل من GitHub
+*.bat text eol=crlf
+# ملفات ثنائية: لا تُعدَّل
+*.docx binary
+*.png binary
+*.ico binary
+*.jpg binary
+*.woff2 binary
+*.ttf binary

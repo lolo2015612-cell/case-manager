@@ -1,0 +1,1500 @@
+// ============================================================
+// نظام إدارة القضايا - تطبيق سطح المكتب (Electron)
+// ============================================================
+// نسخة مستقلة (Standalone): لا تتصل بـ Firebase ولا بأي خادم. البيانات محلية فقط.
+// (التعليق التالي من النسخة الأصلية ولا ينطبق هنا)
+// ملحوظة مهمة عن آلية المزامنة:
+// - بيانات القضايا والأحكام (cases, favorableJudgments...) بتتزامن
+//   مباشرة مع Firebase Realtime Database من داخل index.html نفسه،
+//   بنفس الطريقة اللي بتحصل على الموبايل تمامًا. الملف ده (main.js)
+//   عمدًا مبيتدخلش في ده، عشان التطبيق يفضل مرتبط ببيانات الموبايل
+//   بدون أي فرق.
+// - الحاجة الوحيدة اللي التطبيق ده بيضيفها كنسخة "سطح مكتب حقيقية"
+//   هي تخزين المستندات (PDF, صور, Word...) فعليًا على قرص الجهاز
+//   بدل تخزينها كـ Base64 داخل قاعدة البيانات، عشان الأداء والسعة.
+// ============================================================
+
+const { app, BrowserWindow, ipcMain, dialog, shell, clipboard, Menu, MenuItem } = require('electron');
+const { pathToFileURL } = require('url');
+const path = require('path');
+const fs = require('fs');
+const { exec, execFile, execSync } = require('child_process');
+
+const DEFAULT_STORAGE_DIRNAME = 'مستندات نظام إدارة القضايا - نسخة مستقلة';
+const CONFIG_FILE = path.join(app.getPath('userData'), 'config.json');
+
+let mainWindow = null;
+
+app.setName('نظام إدارة القضايا - نسخة مستقلة');
+
+// ---------------------------------------------------------------
+// إدارة الإعدادات (مسار مجلد التخزين المختار)
+// ---------------------------------------------------------------
+function readConfig() {
+    try {
+        if (fs.existsSync(CONFIG_FILE)) {
+            return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
+        }
+    } catch (e) {
+        console.warn('تعذرت قراءة ملف الإعدادات:', e.message);
+    }
+    return {};
+}
+
+function writeConfig(cfg) {
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), 'utf-8');
+}
+
+function getStorageFolder() {
+    const cfg = readConfig();
+    if (cfg.storageFolder && fs.existsSync(cfg.storageFolder)) {
+        return cfg.storageFolder;
+    }
+    // مجلد افتراضي داخل "المستندات" الخاصة بالمستخدم أول مرة يتم تشغيل التطبيق
+    const defaultFolder = path.join(app.getPath('documents'), DEFAULT_STORAGE_DIRNAME);
+    fs.mkdirSync(defaultFolder, { recursive: true });
+    const newCfg = { ...cfg, storageFolder: defaultFolder };
+    writeConfig(newCfg);
+    return defaultFolder;
+}
+
+function getIndexFilePath() {
+    return path.join(getStorageFolder(), 'documents-index.json');
+}
+
+// ---------------------------------------------------------------
+// نسخة احتياطية محلية دائمة لبيانات القضايا (cases, judgments...) على
+// قرص الجهاز، جنب مجلد المستندات نفسه. دي كانت مفقودة فعليًا من قبل رغم
+// إن كود الواجهة (index.html) مكتوب بيتوقعها وبينادي عليها - وهو بالظبط
+// السبب اللي كان بيخلي التطبيق يعتمد بشكل كامل على وصول Firebase وقت فتح
+// البرنامج؛ لو حصل أي انقطاع مؤقت في الشبكة وقت البدء، كان بيظهر للمستخدم
+// إن كل البيانات اختفت رغم إنها لسه موجودة فعليًا على Firebase.
+function getAppDataFilePath() {
+    return path.join(getStorageFolder(), 'app-data.json');
+}
+
+function getAppDataBackupFilePath() {
+    return path.join(getStorageFolder(), 'app-data.backup.json');
+}
+
+const TRACKED_DATA_KEYS = [
+    'cases', 'favorableJudgments', 'againstJudgments', 'reservedCases',
+    'cancelledCases', 'suspendedCases', 'archivedCases', 'notifications', 'departments',
+    'underFilingCases', 'underFilingAppeals'
+];
+
+function isCompletelyEmptyData(data) {
+    if (!data || typeof data !== 'object') return true;
+    return TRACKED_DATA_KEYS.every(key => !Array.isArray(data[key]) || data[key].length === 0);
+}
+
+ipcMain.handle('loadData', async () => {
+    try {
+        const p = getAppDataFilePath();
+        if (fs.existsSync(p)) {
+            const raw = fs.readFileSync(p, 'utf-8');
+            return JSON.parse(raw);
+        }
+        return null;
+    } catch (e) {
+        console.warn('تعذرت قراءة ملف النسخة المحلية للبيانات، سيتم تجربة النسخة الاحتياطية:', e.message);
+        // الملف الأساسي اتعطب (مثلاً بسبب انقطاع كهرباء أثناء الكتابة)؛
+        // نحاول نرجع للنسخة الاحتياطية بدل ما نرجع فاضي
+        try {
+            const backupPath = getAppDataBackupFilePath();
+            if (fs.existsSync(backupPath)) {
+                return JSON.parse(fs.readFileSync(backupPath, 'utf-8'));
+            }
+        } catch (e2) {
+            console.warn('تعذرت قراءة النسخة الاحتياطية أيضًا:', e2.message);
+        }
+        return null;
+    }
+});
+
+ipcMain.handle('saveData', async (event, data) => {
+    try {
+        if (!data || typeof data !== 'object') {
+            return { success: false, error: 'بيانات غير صالحة' };
+        }
+
+        const p = getAppDataFilePath();
+        const forceEmpty = data.forceEmpty === true;
+        // الحقل ده مجرد إشارة داخلية للسماح بحفظ بيانات فاضية عمدًا (زر "مسح
+        // جميع البيانات" مثلاً)؛ مش جزء من شكل البيانات المحفوظ فعليًا
+        if ('forceEmpty' in data) delete data.forceEmpty;
+
+        // شبكة أمان: لو الملف الموجود فيه بيانات حقيقية، ومطلوب نحفظ محله
+        // بيانات فاضية تمامًا من كل الفئات، ده مؤشر قوي على خطأ (فشل تحميل
+        // مؤقت مثلاً) مش رغبة حقيقية في مسح كل حاجة. في الحالة دي منكتبش
+        // فوق الملف، ونرجع فشل بدل ما نفقد البيانات المحفوظة فعليًا. الاستثناء
+        // الوحيد: لو الطلب مُعلّم صراحةً كمسح متعمد (forceEmpty).
+        if (!forceEmpty && isCompletelyEmptyData(data) && fs.existsSync(p)) {
+            try {
+                const existing = JSON.parse(fs.readFileSync(p, 'utf-8'));
+                if (!isCompletelyEmptyData(existing)) {
+                    console.warn('تم تجاهل محاولة حفظ بيانات فاضية فوق نسخة محلية فيها بيانات حقيقية');
+                    return { success: false, error: 'رفض الحفظ: البيانات الجديدة فاضية بالكامل بينما الملف المحفوظ فيه بيانات' };
+                }
+            } catch (e) { /* الملف الحالي معطوب أصلاً، كمّل عادي */ }
+        }
+
+        // قبل الاستبدال، نحتفظ بنسخة من آخر حفظة صحيحة كنسخة احتياطية دوّارة
+        try {
+            if (fs.existsSync(p)) {
+                fs.copyFileSync(p, getAppDataBackupFilePath());
+            }
+        } catch (e) {
+            console.warn('تعذر أخذ نسخة احتياطية قبل الحفظ:', e.message);
+        }
+
+        // كتابة ذرية: نكتب في ملف مؤقت الأول ثم نستبدل الملف الأصلي دفعة
+        // واحدة، عشان لو حصل انقطاع كهرباء أو انهيار مفاجئ أثناء الكتابة
+        // نفسها، الملف الأصلي يفضل سليم زي ما كان
+        const tmpPath = `${p}.tmp`;
+        fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf-8');
+        fs.renameSync(tmpPath, p);
+
+        // نسخة احتياطية يومية مؤرخة (واحدة لكل يوم)، يُحتفظ بآخر 30 يومًا
+        try { writeDailyBackup(p); } catch (e) { console.warn('تعذر أخذ النسخة اليومية:', e.message); }
+
+        return { success: true };
+    } catch (e) {
+        console.error('saveData error:', e);
+        return { success: false, error: e.message };
+    }
+});
+
+
+// ---------------------------------------------------------------
+// نسخ احتياطية مؤرخة داخل مجلد backups بجانب بيانات البرنامج
+// ---------------------------------------------------------------
+const BACKUP_KEEP_DAYS = 30;
+const BACKUP_NAME_RE = /^app-data-(\d{4}-\d{2}-\d{2})(?:_\d{6})?(?:-[A-Za-z0-9_؀-ۿ]+)?\.json$/;
+
+function getBackupsFolder() {
+    const dir = path.join(getStorageFolder(), 'backups');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    return dir;
+}
+
+function localDateStamp(d = new Date()) {
+    const z = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}`;
+}
+
+function pruneOldBackups() {
+    const dir = getBackupsFolder();
+    const limit = Date.now() - BACKUP_KEEP_DAYS * 24 * 3600 * 1000;
+    fs.readdirSync(dir).forEach(name => {
+        if (!BACKUP_NAME_RE.test(name)) return;
+        try {
+            const full = path.join(dir, name);
+            if (fs.statSync(full).mtimeMs < limit) fs.unlinkSync(full);
+        } catch (e) { /* تجاهل */ }
+    });
+}
+
+// تُستدعى بعد كل حفظ ناجح؛ تُنشئ نسخة اليوم مرة واحدة فقط (أول حفظ في اليوم) ما لم تكن البيانات فاضية
+function writeDailyBackup(dataFilePath) {
+    const dir = getBackupsFolder();
+    const target = path.join(dir, `app-data-${localDateStamp()}.json`);
+    if (fs.existsSync(target)) return;
+    try {
+        const current = JSON.parse(fs.readFileSync(dataFilePath, 'utf-8'));
+        if (isCompletelyEmptyData(current)) return;
+    } catch (e) { return; }
+    fs.copyFileSync(dataFilePath, target);
+    pruneOldBackups();
+}
+
+ipcMain.handle('createBackup', async (event, { label } = {}) => {
+    try {
+        const p = getAppDataFilePath();
+        if (!fs.existsSync(p)) return { success: false, error: 'لا توجد بيانات محفوظة بعد' };
+        const safeLabel = String(label || 'manual').replace(/[^A-Za-z0-9_؀-ۿ]/g, '').slice(0, 20) || 'manual';
+        const now = new Date();
+        const z = n => String(n).padStart(2, '0');
+        const name = `app-data-${localDateStamp(now)}_${z(now.getHours())}${z(now.getMinutes())}${z(now.getSeconds())}-${safeLabel}.json`;
+        fs.copyFileSync(p, path.join(getBackupsFolder(), name));
+        return { success: true, name };
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+});
+
+ipcMain.handle('listBackups', async () => {
+    try {
+        const dir = getBackupsFolder();
+        const files = fs.readdirSync(dir).filter(n => BACKUP_NAME_RE.test(n)).map(name => {
+            const st = fs.statSync(path.join(dir, name));
+            return { name, size: st.size, modifiedAt: st.mtimeMs };
+        }).sort((a, b) => b.modifiedAt - a.modifiedAt);
+        return { success: true, files, folder: dir };
+    } catch (e) {
+        return { success: false, files: [], error: e.message };
+    }
+});
+
+// يرجع محتوى النسخة (كائن البيانات) ليطبّقه الواجهة بعد تأكيد المستخدم
+ipcMain.handle('readBackup', async (event, { name } = {}) => {
+    try {
+        const safe = path.basename(String(name || ''));
+        if (!BACKUP_NAME_RE.test(safe)) return { success: false, error: 'اسم نسخة غير صالح' };
+        const full = path.join(getBackupsFolder(), safe);
+        if (!fs.existsSync(full)) return { success: false, error: 'النسخة غير موجودة' };
+        return { success: true, data: JSON.parse(fs.readFileSync(full, 'utf-8')) };
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+});
+
+ipcMain.handle('openBackupsFolder', async () => {
+    try { await shell.openPath(getBackupsFolder()); return { success: true }; }
+    catch (e) { return { success: false, error: e.message }; }
+});
+
+function readIndex() {
+    try {
+        const p = getIndexFilePath();
+        if (fs.existsSync(p)) {
+            return JSON.parse(fs.readFileSync(p, 'utf-8'));
+        }
+    } catch (e) {
+        console.warn('تعذرت قراءة فهرس المستندات:', e.message);
+    }
+    return {};
+}
+
+function writeIndex(indexData) {
+    fs.writeFileSync(getIndexFilePath(), JSON.stringify(indexData, null, 2), 'utf-8');
+}
+
+function sanitizeName(name) {
+    return String(name || 'file').replace(/[\\/:*?"<>|]/g, '_').trim();
+}
+
+// ---------------------------------------------------------------
+// تسمية مجلدات القضايا تلقائيًا بأسماء الأطراف ورقم وسنة الدعوى
+// ---------------------------------------------------------------
+// بدل ما يتعمل مجلد باسم رقم داخلي (caseId) غير مفهوم، بنعمل مجلد باسم
+// واضح زي: "محمد أحمد ضد شركة النور - قضية رقم 1234 لسنة 2026".
+// بنحتفظ بربط ثابت (caseId -> اسم المجلد) في ملف فهرس منفصل، عشان لو
+// المستخدم عدّل بيانات القضية بعدين، نقدر نعيد تسمية المجلد تلقائيًا
+// بدل ما نعمل مجلد تاني ونفقد الملفات القديمة.
+
+const CASE_FOLDERS_INDEX_FILENAME = 'case-folders-index.json';
+
+function getCaseFoldersIndexPath() {
+    return path.join(getStorageFolder(), CASE_FOLDERS_INDEX_FILENAME);
+}
+
+function readCaseFoldersIndex() {
+    try {
+        const p = getCaseFoldersIndexPath();
+        if (fs.existsSync(p)) {
+            return JSON.parse(fs.readFileSync(p, 'utf-8'));
+        }
+    } catch (e) {
+        console.warn('تعذرت قراءة فهرس مجلدات القضايا:', e.message);
+    }
+    return {};
+}
+
+function writeCaseFoldersIndex(data) {
+    fs.writeFileSync(getCaseFoldersIndexPath(), JSON.stringify(data, null, 2), 'utf-8');
+}
+
+function buildCaseFolderName(caseData, caseId) {
+    const plaintiff = String((caseData && caseData.plaintiff) || '').trim();
+    const defendant = String((caseData && caseData.defendant) || '').trim();
+    const number = String((caseData && (caseData.number || caseData.caseNumber)) || '').trim();
+    const year = String((caseData && (caseData.year || caseData.caseYear)) || '').trim();
+
+    // نفس أسلوب التسمية اللي المستخدم شغال بيه يدويًا بالفعل:
+    // "اسم المدعي_اسم المدعي عليه_رقم_سنة" (المسافات بتتحول لـ "_")
+    const parts = [];
+    if (plaintiff) parts.push(plaintiff);
+    if (defendant) parts.push(defendant);
+    if (number) parts.push(number);
+    if (year) parts.push(year);
+
+    let name = parts.length ? parts.join('_') : `قضية_${caseId}`;
+
+    name = sanitizeName(name);
+    // تقصير الاسم لو طويل جدًا عشان نتجنب مشاكل حدود طول المسار في ويندوز
+    const MAX_LEN = 120;
+    if (name.length > MAX_LEN) {
+        name = name.slice(0, MAX_LEN).trim();
+    }
+    return name;
+}
+
+// مقارنة رقمية مرنة: بتتجاهل المسافات والأصفار الزيادة في البداية
+// (مثلاً "08" هتتطابق مع "8")
+function numbersMatch(a, b) {
+    const sa = String(a || '').trim();
+    const sb = String(b || '').trim();
+    if (!sa || !sb) return false;
+    if (sa === sb) return true;
+    const na = parseInt(sa, 10);
+    const nb = parseInt(sb, 10);
+    return !isNaN(na) && !isNaN(nb) && na === nb;
+}
+
+function normalizeForFolderMatch(s) {
+    return String(s || '').trim().replace(/\s+/g, ' ');
+}
+
+// بتدور على مجلد موجود بالفعل جوه مجلد التخزين خاص بنفس القضية دي، حتى
+// لو كان اتعمل يدويًا قبل استخدام هذه الميزة. بتجرب أولاً مطابقة بادئة
+// اسم المدعي + المدعي عليه (وهو الأسلوب الثابت اللي المستخدم بيسمي بيه
+// كل مجلداته)، ولو مالقتش، بتدور على رقم وسنة الدعوى في أي ترتيب داخل
+// اسم المجلد (قبل أو بعد بعض).
+function findExistingFolderForCase(storageFolder, caseData, excludeFolderName) {
+    if (!caseData) return null;
+
+    let entries = [];
+    try {
+        entries = fs.readdirSync(storageFolder, { withFileTypes: true }).filter(e => e.isDirectory());
+    } catch (err) {
+        console.warn('تعذر قراءة مجلد التخزين:', err.message);
+        return null;
+    }
+
+    const plaintiff = normalizeForFolderMatch(caseData.plaintiff);
+    const defendant = normalizeForFolderMatch(caseData.defendant);
+    const number = String((caseData.number || caseData.caseNumber) || '').trim();
+    const year = String((caseData.year || caseData.caseYear) || '').trim();
+
+    // المرحلة 1: مطابقة بادئة اسم المدعي + المدعي عليه
+    if (plaintiff && defendant) {
+        const prefix = `${plaintiff}_${defendant}`;
+        for (const e of entries) {
+            if (excludeFolderName && e.name === excludeFolderName) continue;
+            if (e.name.indexOf(prefix) === 0) return e.name;
+        }
+    }
+
+    // المرحلة 2: مطابقة برقم وسنة الدعوى + وجود اسم أحد الطرفين (المدعي أو
+    // المدعي عليه) في اسم المجلد كمان. لازم الشرطين مع بعض، لأن الاعتماد على
+    // رقم وسنة الدعوى وحدهم مش آمن: قضيتين مختلفتين تمامًا (بدائرتين مختلفتين
+    // مثلاً) ممكن جدًا يكون ليهم نفس الرقم ونفس السنة بالصدفة، وده كان بيسبب
+    // مشكلة خطيرة: مستندات قضية جديدة كانت بتتحط في مجلد قضية تانية قديمة
+    // بس لمجرد تطابق الرقم والسنة، من غير أي تحقق من هوية الأطراف.
+    if (number && year && (plaintiff || defendant)) {
+        for (const e of entries) {
+            if (excludeFolderName && e.name === excludeFolderName) continue;
+
+            const tokens = e.name.split(/[_\-\s]+/);
+            let numberYearMatches = false;
+            for (let i = 0; i < tokens.length; i++) {
+                if (!/^\d{4}$/.test(tokens[i]) || !numbersMatch(tokens[i], year)) continue;
+                const before = tokens[i - 1];
+                const after = tokens[i + 1];
+                if ((before && /^\d+$/.test(before) && numbersMatch(before, number)) ||
+                    (after && /^\d+$/.test(after) && numbersMatch(after, number))) {
+                    numberYearMatches = true;
+                    break;
+                }
+            }
+            if (!numberYearMatches) continue;
+
+            // لازم كمان اسم أحد الطرفين يكون موجود فعلاً جوه اسم المجلد،
+            // كتأكيد إضافي إن ده نفس القضية بالظبط مش بس نفس الرقم بالصدفة
+            const nameHasParty = (plaintiff && e.name.indexOf(plaintiff) !== -1) ||
+                                  (defendant && e.name.indexOf(defendant) !== -1);
+            if (nameHasParty) return e.name;
+        }
+    }
+
+    return null;
+}
+
+// بتنقل أي ملفات كانت اتحفظت بالغلط في مجلد قديم (نتيجة محاولة سابقة قبل
+// اكتشاف المجلد الصحيح) إلى المجلد الصحيح الموجود بالفعل على القرص،
+// وبتحدث فهرس المستندات لو اضطرينا نغير اسم أي ملف عشان تعارض أسماء،
+// وبتحذف المجلد القديم لو فضل فاضي بعد النقل.
+function mergeFolderInto(storageFolder, sourceFolderName, targetFolderName, caseId) {
+    try {
+        const sourcePath = path.join(storageFolder, sourceFolderName);
+        const targetPath = path.join(storageFolder, targetFolderName);
+        if (!fs.existsSync(sourcePath)) return;
+        fs.mkdirSync(targetPath, { recursive: true });
+
+        const files = fs.readdirSync(sourcePath, { withFileTypes: true }).filter(f => f.isFile());
+        if (files.length === 0) {
+            try { fs.rmdirSync(sourcePath); } catch (e) { /* تجاهل */ }
+            return;
+        }
+
+        const index = readIndex();
+        let indexChanged = false;
+
+        for (const f of files) {
+            const src = path.join(sourcePath, f.name);
+            let destName = f.name;
+            let dest = path.join(targetPath, destName);
+            if (fs.existsSync(dest)) {
+                const parsed = path.parse(f.name);
+                destName = `${parsed.name}_${Date.now()}${parsed.ext}`;
+                dest = path.join(targetPath, destName);
+            }
+            try {
+                fs.renameSync(src, dest);
+                if (destName !== f.name && caseId && index[caseId]) {
+                    index[caseId].forEach(entry => {
+                        if (entry.storedFileName === f.name) {
+                            entry.storedFileName = destName;
+                            indexChanged = true;
+                        }
+                    });
+                }
+            } catch (e) {
+                console.warn('تعذر نقل ملف أثناء الدمج:', e.message);
+            }
+        }
+
+        if (indexChanged) writeIndex(index);
+
+        try {
+            const remaining = fs.readdirSync(sourcePath);
+            if (remaining.length === 0) fs.rmdirSync(sourcePath);
+        } catch (e) { /* تجاهل */ }
+    } catch (e) {
+        console.warn('تعذر دمج مجلد القضية القديم مع المجلد الصحيح:', e.message);
+    }
+}
+
+// بيرجع المسار الكامل لمجلد القضية على القرص، وبينشئه لو مش موجود.
+// لو اتبعتت caseData (بيانات المدعي/المدعي عليه/الرقم/السنة)، وكان اسم
+// المجلد القديم مختلف عن الاسم المفروض حاليًا (يعني بيانات القضية اتغيرت)،
+// بيتم إعادة تسمية المجلد تلقائيًا مع الحفاظ على كل الملفات جواه.
+// المجلد الأساسي لكل مستندات قسم "تحت الرفع" (قضايا واستئنافات)، جوه نفس
+// مجلد التخزين الرئيسي اللي بيه كل مستندات القضايا في البرنامج
+function getUnderFilingBaseFolder() {
+    const base = path.join(getStorageFolder(), 'تحت الرفع');
+    if (!fs.existsSync(base)) {
+        fs.mkdirSync(base, { recursive: true });
+    }
+    return base;
+}
+
+// اسم مجلد سجل "تحت الرفع" (قضية أو استئناف): برقم الاستئناف/القيد + أسماء
+// الخصوم، ولو معندوش رقم لسه، بأسماء الخصوم بس
+function buildUnderFilingFolderName(caseData, caseId) {
+    const plaintiff = String((caseData && caseData.plaintiff) || '').trim();
+    const defendant = String((caseData && caseData.defendant) || '').trim();
+    const number = String((caseData && caseData.number) || '').trim();
+
+    const parts = [];
+    if (number) parts.push(number);
+    if (plaintiff) parts.push(plaintiff);
+    if (defendant) parts.push(defendant);
+
+    let name = parts.length ? parts.join('_') : `سجل_تحت_الرفع_${caseId}`;
+
+    name = sanitizeName(name);
+    const MAX_LEN = 120;
+    if (name.length > MAX_LEN) {
+        name = name.slice(0, MAX_LEN).trim();
+    }
+    return name;
+}
+
+const UNDER_FILING_PREFIX = 'تحت الرفع' + path.sep;
+
+function getCaseFolderPath(caseId, caseData) {
+    const root = getStorageFolder();
+    const mapping = readCaseFoldersIndex();
+    const storedRelPath = mapping[caseId];
+
+    // تحديد هل السجل ده تابع لقسم "تحت الرفع" ولا لا: من العلم underFiling
+    // في البيانات الجديدة (أول مرة أو لما البيانات تتغير)، أو من شكل المسار
+    // المحفوظ مسبقًا في الفهرس (في المرات اللي مفيش فيها caseData، زي الحذف
+    // أو الفتح أو القراءة)
+    const isUnderFiling = caseData
+        ? !!caseData.underFiling
+        : !!(storedRelPath && storedRelPath.indexOf(UNDER_FILING_PREFIX) === 0);
+
+    const baseDir = isUnderFiling ? getUnderFilingBaseFolder() : root;
+    const nameBuilder = isUnderFiling ? buildUnderFilingFolderName : buildCaseFolderName;
+
+    // اسم المجلد الفعلي جوه baseDir (من غير بادئة "تحت الرفع/" لو موجودة)
+    let folderName = storedRelPath && storedRelPath.indexOf(UNDER_FILING_PREFIX) === 0
+        ? storedRelPath.slice(UNDER_FILING_PREFIX.length)
+        : storedRelPath;
+
+    if (caseData) {
+        // ندور دايمًا (مش أول مرة بس) على مجلد حقيقي موجود بالفعل على القرص
+        // خاص بنفس القضية دي، غير المجلد المربوط حاليًا. لو لقينا واحد، ده
+        // معناه إن الربط الحالي (لو موجود) كان غلط من محاولة قديمة، فبننقل
+        // أي ملفات كانت اتحفظت فيه للمجلد الصحيح، ونصحح الربط.
+        const realFolder = findExistingFolderForCase(baseDir, caseData, folderName);
+
+        if (realFolder && realFolder !== folderName) {
+            if (folderName) {
+                mergeFolderInto(baseDir, folderName, realFolder, caseId);
+            }
+            folderName = realFolder;
+            mapping[caseId] = isUnderFiling ? path.join('تحت الرفع', folderName) : folderName;
+            writeCaseFoldersIndex(mapping);
+        } else if (!folderName) {
+            folderName = nameBuilder(caseData, caseId);
+            mapping[caseId] = isUnderFiling ? path.join('تحت الرفع', folderName) : folderName;
+            writeCaseFoldersIndex(mapping);
+        } else {
+            // معندناش مجلد حقيقي تاني بنفس بيانات القضية، بس قبل ما نثق في
+            // المجلد المربوط حاليًا، لازم نتأكد الأول إنه فعلاً مخصص للقضية
+            // دي وحدها، مش مجلد بيشاركه معاها caseId تاني (وده بالظبط السيناريو
+            // اللي كان بيحصل فيه الخطأ قبل كده: قضيتين مختلفتين اتسجلوا على
+            // نفس المجلد بالغلط بسبب تطابق الرقم والسنة بالصدفة).
+            const otherCaseIdsSharingFolder = Object.keys(mapping).filter(
+                id => id !== caseId && mapping[id] === (isUnderFiling ? path.join('تحت الرفع', folderName) : folderName)
+            );
+
+            if (otherCaseIdsSharingFolder.length > 0) {
+                // المجلد ده مستخدم فعليًا من قضية تانية غيرنا؛ منلمسوش خالص
+                // (عشان محفضاش ملفاتها)، وبننشئ مجلد جديد صحيح مخصص للقضية
+                // الحالية بس، ونحدّث الربط بتاعها هي بس
+                folderName = nameBuilder(caseData, caseId);
+                mapping[caseId] = isUnderFiling ? path.join('تحت الرفع', folderName) : folderName;
+                writeCaseFoldersIndex(mapping);
+            } else {
+                // المجلد ده فعلاً بتاع القضية دي وحدها؛ ممكن بس بيانات القضية
+                // اتغيرت (رقمها أو اسم الأطراف)، فنعيد تسمية المجلد الحالي
+                // ليطابق التغيير مع الحفاظ على كل الملفات جواه
+                const desiredName = nameBuilder(caseData, caseId);
+                if (desiredName && desiredName !== folderName) {
+                    const oldPath = path.join(baseDir, folderName);
+                    const newPath = path.join(baseDir, desiredName);
+                    try {
+                        if (fs.existsSync(oldPath) && !fs.existsSync(newPath)) {
+                            fs.renameSync(oldPath, newPath);
+                        }
+                    } catch (e) {
+                        console.warn('تعذر إعادة تسمية مجلد القضية:', e.message);
+                    }
+                    folderName = desiredName;
+                    mapping[caseId] = isUnderFiling ? path.join('تحت الرفع', folderName) : folderName;
+                    writeCaseFoldersIndex(mapping);
+                }
+            }
+        }
+    } else if (!folderName) {
+        folderName = sanitizeName(String(caseId));
+        mapping[caseId] = isUnderFiling ? path.join('تحت الرفع', folderName) : folderName;
+        writeCaseFoldersIndex(mapping);
+    }
+
+    const fullPath = path.join(baseDir, folderName);
+    fs.mkdirSync(fullPath, { recursive: true });
+    return fullPath;
+}
+
+function guessMimeType(filename) {
+    const ext = (String(filename).split('.').pop() || '').toLowerCase();
+    const map = {
+        pdf: 'application/pdf',
+        doc: 'application/msword',
+        docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        xls: 'application/vnd.ms-excel',
+        xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        png: 'image/png',
+        jpg: 'image/jpeg',
+        jpeg: 'image/jpeg',
+        gif: 'image/gif',
+        webp: 'image/webp',
+        txt: 'text/plain'
+    };
+    return map[ext] || 'application/octet-stream';
+}
+
+// ---------------------------------------------------------------
+// فتح ملفات الـ PDF في متصفح كروم تحديدًا (أو المتصفح الافتراضي
+// للجهاز لو كروم مش متثبت)، بدل ما تتفتح جوه نافذة البرنامج نفسه.
+// ---------------------------------------------------------------
+
+// بيدور على مسار برنامج كروم المثبت على الجهاز (لو موجود)
+function findChromeExecutablePath() {
+    try {
+        if (process.platform === 'win32') {
+            const candidates = [
+                path.join(process.env['PROGRAMFILES'] || 'C:\\Program Files', 'Google\\Chrome\\Application\\chrome.exe'),
+                path.join(process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)', 'Google\\Chrome\\Application\\chrome.exe'),
+                path.join(process.env['LOCALAPPDATA'] || '', 'Google\\Chrome\\Application\\chrome.exe')
+            ];
+            for (const c of candidates) {
+                if (c && fs.existsSync(c)) return c;
+            }
+
+            // احتياطي: نقرأ مسار البرنامج المسجل في الـ Registry (App Paths)
+            const regKeys = [
+                'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\chrome.exe',
+                'HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\App Paths\\chrome.exe',
+                'HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\chrome.exe'
+            ];
+            for (const key of regKeys) {
+                try {
+                    const out = execSync(`reg query "${key}" /ve`, { windowsHide: true }).toString();
+                    const m = out.match(/REG_SZ\s+(.+)/);
+                    if (m) {
+                        const p = m[1].trim().replace(/^"|"$/g, '');
+                        if (p && fs.existsSync(p)) return p;
+                    }
+                } catch (e) { /* المفتاح ده مش موجود، جرّب اللي بعده */ }
+            }
+            return null;
+        }
+
+        if (process.platform === 'darwin') {
+            const candidates = [
+                '/Applications/Google Chrome.app',
+                path.join(require('os').homedir(), 'Applications/Google Chrome.app')
+            ];
+            for (const c of candidates) {
+                if (fs.existsSync(c)) return c;
+            }
+            return null;
+        }
+
+        // لينكس
+        for (const name of ['google-chrome', 'google-chrome-stable', 'chromium-browser', 'chromium']) {
+            try {
+                const out = execSync(`command -v ${name}`, { shell: '/bin/bash' }).toString().trim();
+                if (out) return out;
+            } catch (e) { /* مش موجود، جرّب اللي بعده */ }
+        }
+        return null;
+    } catch (e) {
+        console.warn('تعذر البحث عن مسار كروم:', e.message);
+        return null;
+    }
+}
+
+// بيدور على أمر تشغيل المتصفح الافتراضي المسجل على ويندوز (لو كروم مش موجود)
+function getWindowsDefaultBrowserCommand() {
+    if (process.platform !== 'win32') return null;
+    try {
+        const out = execSync(
+            'reg query "HKCU\\Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\http\\UserChoice" /v ProgId',
+            { windowsHide: true }
+        ).toString();
+        const m = out.match(/ProgId\s+REG_SZ\s+(\S+)/);
+        if (!m) return null;
+        const progId = m[1];
+
+        const cmdOut = execSync(`reg query "HKCR\\${progId}\\shell\\open\\command" /ve`, { windowsHide: true }).toString();
+        const cmdMatch = cmdOut.match(/REG_SZ\s+(.+)/);
+        if (!cmdMatch) return null;
+        return cmdMatch[1].trim(); // شكله عادة: "C:\...\browser.exe" -- "%1"
+    } catch (e) {
+        return null;
+    }
+}
+
+// بيفتح ملف بمتصفح كروم لو موجود، ولو مش موجود بيجرب المتصفح الافتراضي
+// المسجل على الجهاز، وآخر حل احتياطي: البرنامج الافتراضي المرتبط بامتداد الملف
+function openFileInBrowser(fullPath) {
+    return new Promise((resolve) => {
+        const chromePath = findChromeExecutablePath();
+
+        if (chromePath) {
+            if (process.platform === 'darwin') {
+                execFile('open', ['-a', chromePath, fullPath], (err) => resolve(!err));
+            } else {
+                execFile(chromePath, [fullPath], (err) => resolve(!err));
+            }
+            return;
+        }
+
+        // مفيش كروم متثبت على الجهاز... جرّب المتصفح الافتراضي المسجل عليه
+        if (process.platform === 'win32') {
+            const cmdTemplate = getWindowsDefaultBrowserCommand();
+            if (cmdTemplate) {
+                const finalCmd = cmdTemplate.includes('%1')
+                    ? cmdTemplate.replace(/%1/g, `"${fullPath}"`)
+                    : `${cmdTemplate} "${fullPath}"`;
+                exec(finalCmd, (err) => {
+                    if (!err) { resolve(true); return; }
+                    // فشل تشغيل المتصفح الافتراضي، اعرض الملف بالبرنامج
+                    // الافتراضي المرتبط بامتداده كآخر حل احتياطي
+                    shell.openPath(fullPath).then(result => resolve(!result));
+                });
+                return;
+            }
+        }
+
+        // آخر حل احتياطي: افتح بالبرنامج الافتراضي المرتبط بامتداد الملف
+        shell.openPath(fullPath).then(result => resolve(!result));
+    });
+}
+
+// ---------------------------------------------------------------
+// إنشاء نافذة التطبيق
+// ---------------------------------------------------------------
+function createWindow() {
+    mainWindow = new BrowserWindow({
+        width: 1366,
+        height: 850,
+        minWidth: 1000,
+        minHeight: 650,
+        title: 'نظام إدارة القضايا - المستشار محمود العوابدي',
+        icon: path.join(__dirname, 'build', 'icon.png'),
+        autoHideMenuBar: true,
+        webPreferences: {
+            preload: path.join(__dirname, 'preload.js'),
+            contextIsolation: true,
+            nodeIntegration: false,
+            sandbox: false
+        }
+    });
+
+    // ملحوظة مهمة: كنا بنعطل القائمة تمامًا (setApplicationMenu(null))، وده كان
+    // بيمنع اختصارات النسخ/اللصق/القص/تحديد الكل (Ctrl+C, Ctrl+V, Ctrl+X, Ctrl+A)
+    // من العمل خالص جوه أي حقل إدخال — لأن Electron (على عكس المتصفح العادي)
+    // بيفعّل الاختصارات دي عن طريق أدوار القائمة (roles)، مش تلقائيًا من النظام.
+    // الحل: نعمل قائمة بسيطة فيها بس أدوار التحرير القياسية، ونسيب autoHideMenuBar
+    // يخفيها بصريًا زي ما هي، فالشكل يفضل نضيف والاختصارات تشتغل.
+    const editMenuTemplate = [
+        {
+            label: 'تحرير',
+            submenu: [
+                { role: 'undo', label: 'تراجع' },
+                { role: 'redo', label: 'إعادة' },
+                { type: 'separator' },
+                { role: 'cut', label: 'قص' },
+                { role: 'copy', label: 'نسخ' },
+                { role: 'paste', label: 'لصق' },
+                { role: 'selectAll', label: 'تحديد الكل' }
+            ]
+        },
+        {
+            label: 'عرض',
+            submenu: [
+                { role: 'reload', label: 'إعادة تحميل' },
+                { role: 'toggleDevTools', label: 'أدوات المطور' }
+            ]
+        }
+    ];
+    Menu.setApplicationMenu(Menu.buildFromTemplate(editMenuTemplate));
+    mainWindow.loadFile(path.join(__dirname, 'app', 'index.html'));
+
+    // ==================== ضمان إضافي (احتياطي) لعمل النسخ/اللصق/القص ====================
+    // بالإضافة لأدوار القائمة فوق، بنعترض اختصارات لوحة المفاتيح مباشرة على
+    // مستوى النافذة ونستدعي أوامر التحرير الفعلية (copy/paste/cut/selectAll)
+    // يدويًا على العنصر الذي يملك التركيز حاليًا. ده بيضمن عمل الاختصارات
+    // حتى لو حصلت مشكلة في ربط أدوار القائمة لأي سبب (فروق بين إصدارات
+    // Windows، أو نوافذ فرعية، إلخ).
+    mainWindow.webContents.on('before-input-event', (event, input) => {
+        if (input.type !== 'keyDown') return;
+        const key = (input.key || '').toLowerCase();
+        const ctrlOrCmd = input.control || input.meta;
+        if (!ctrlOrCmd || input.alt) return;
+
+        const wc = mainWindow.webContents;
+        if (key === 'c') { wc.copy(); }
+        else if (key === 'v') { wc.paste(); }
+        else if (key === 'x') { wc.cut(); }
+        else if (key === 'a') { wc.selectAll(); }
+        else if (key === 'z') { input.shift ? wc.redo() : wc.undo(); }
+    });
+
+    // السماح لـ navigator.clipboard (واجهة الحافظة الحديثة في المتصفح) بالعمل
+    // من غير أي رسائل صلاحيات، لأن Electron بيرفضها افتراضيًا لو محدّش سمح بيها.
+    try {
+        const ses = mainWindow.webContents.session;
+        ses.setPermissionRequestHandler((webContents, permission, callback) => {
+            if (permission === 'clipboard-read' || permission === 'clipboard-sanitized-write') {
+                return callback(true);
+            }
+            callback(false);
+        });
+        if (ses.setPermissionCheckHandler) {
+            ses.setPermissionCheckHandler((webContents, permission) => {
+                return permission === 'clipboard-read' || permission === 'clipboard-sanitized-write';
+            });
+        }
+    } catch (e) { /* ignore */ }
+
+    // بدون هذا الإعداد، Electron بيمنع أي نافذة جديدة تتفتح بـ window.open()
+    // بشكل افتراضي، وده اللي كان بيسبب ظهور نافذة بيضاء فاضية عند محاولة
+    // عرض مستند (اللي بيستخدم window.open داخليًا). هنا بنسمح بفتحها صراحة.
+    mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+        // نوافذ العرض/الطباعة الداخلية في البرنامج (زي معاينة المستندات
+        // وتقارير الطباعة) بتتفتح بـ window.open('', '_blank') من غير رابط
+        // حقيقي (about:blank)، فديه لازم تفضل تتفتح جوه نافذة تابعة للبرنامج
+        if (!url || url === 'about:blank') {
+            return {
+                action: 'allow',
+                overrideBrowserWindowOptions: {
+                    autoHideMenuBar: true,
+                    webPreferences: {
+                        contextIsolation: true,
+                        nodeIntegration: false,
+                        sandbox: false,
+                        // لازم نفعّل ده صراحة، وإلا وسم <embed type="application/pdf">
+                        // هيفضل شاشة بيضاء فاضية من غير ما يعرض محتوى ملف الـ PDF
+                        plugins: true
+                    }
+                }
+            };
+        }
+
+        // أي رابط خارجي حقيقي (زي روابط مشاركة واتساب wa.me) لازم يتفتح
+        // بتطبيق واتساب نفسه أو المتصفح الافتراضي المسجل دخوله بحساب
+        // المستخدم على الجهاز، مش جوه نافذة جديدة فاضية تابعة للبرنامج —
+        // النافذة الجديدة دي معندهاش أي جلسة واتساب مسجلة، فكانت المشاركة
+        // بتفشل أو تفضل عالقة على صفحة تسجيل دخول واتساب ويب فاضية.
+        shell.openExternal(url).catch(err => console.warn('تعذر فتح الرابط الخارجي:', err.message));
+        return { action: 'deny' };
+    });
+
+    mainWindow.on('closed', () => {
+        mainWindow = null;
+    });
+}
+
+// ---------------------------------------------------------------
+// قائمة نسخ/لصق تظهر بالزر الأيمن للماوس (Copy/Paste عن طريق الماوس)
+// ---------------------------------------------------------------
+// بتتفعّل على أي نافذة في البرنامج (النافذة الرئيسية وأي نافذة فرعية زي
+// معاينة المستندات)، وبتعرض بس الخيارات المناسبة حسب مكان الضغطة: لو حقل
+// إدخال قابل للتحرير بتظهر (تراجع/إعادة/قص/نسخ/لصق/تحديد الكل)، ولو نص عادي
+// متحدد بتظهر (نسخ/تحديد الكل)، ولو مفيش تحديد بتظهر (تحديد الكل ولصق لو
+// فيه حاجة في الحافظة).
+function setupCopyPasteContextMenu(webContents) {
+    webContents.on('context-menu', (event, params) => {
+        const menu = new Menu();
+
+        if (params.isEditable) {
+            menu.append(new MenuItem({ label: 'تراجع', role: 'undo', enabled: params.editFlags.canUndo }));
+            menu.append(new MenuItem({ label: 'إعادة', role: 'redo', enabled: params.editFlags.canRedo }));
+            menu.append(new MenuItem({ type: 'separator' }));
+            menu.append(new MenuItem({ label: 'قص', role: 'cut', enabled: params.editFlags.canCut }));
+            menu.append(new MenuItem({ label: 'نسخ', role: 'copy', enabled: params.editFlags.canCopy }));
+            menu.append(new MenuItem({ label: 'لصق', role: 'paste', enabled: params.editFlags.canPaste }));
+            menu.append(new MenuItem({ type: 'separator' }));
+            menu.append(new MenuItem({ label: 'تحديد الكل', role: 'selectAll' }));
+        } else if (params.selectionText && params.selectionText.trim().length > 0) {
+            menu.append(new MenuItem({ label: 'نسخ', role: 'copy' }));
+            menu.append(new MenuItem({ type: 'separator' }));
+            menu.append(new MenuItem({ label: 'تحديد الكل', role: 'selectAll' }));
+        } else {
+            menu.append(new MenuItem({ label: 'تحديد الكل', role: 'selectAll' }));
+            if (params.editFlags && params.editFlags.canPaste) {
+                menu.append(new MenuItem({ label: 'لصق', role: 'paste' }));
+            }
+        }
+
+        menu.popup({ window: BrowserWindow.fromWebContents(webContents) });
+    });
+}
+
+// نطبّق القائمة دي على أي نافذة (webContents) تتفتح في البرنامج كله، مش بس
+// النافذة الرئيسية، عشان تشتغل برضه في نوافذ معاينة المستندات وغيرها.
+app.on('web-contents-created', (event, contents) => {
+    setupCopyPasteContextMenu(contents);
+});
+
+// نسخة واحدة فقط من التطبيق تعمل في نفس الوقت
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+    app.quit();
+} else {
+    app.on('second-instance', () => {
+        if (mainWindow) {
+            if (mainWindow.isMinimized()) mainWindow.restore();
+            mainWindow.focus();
+        }
+    });
+
+    app.whenReady().then(createWindow);
+
+    app.on('window-all-closed', () => {
+        if (process.platform !== 'darwin') app.quit();
+    });
+
+    app.on('activate', () => {
+        if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
+}
+
+// ---------------------------------------------------------------
+// واجهات IPC الخاصة بتخزين المستندات على القرص (Electron API الحقيقية)
+// ---------------------------------------------------------------
+
+ipcMain.handle('saveFile', async (event, { caseId, filename, dataBase64, docType, caseData }) => {
+    try {
+        if (!caseId || !filename || !dataBase64) {
+            return { success: false, error: 'بيانات ناقصة لحفظ الملف' };
+        }
+        const caseFolder = getCaseFolderPath(caseId, caseData);
+
+        const id = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+        // امتداد الملف الأصلي (زي .pdf أو .docx) لازم يفضل زي ما هو دايمًا
+        const originalExt = path.extname(filename) || '';
+
+        // اسم المستند اللي هيظهر للمستخدم ويتسمى بيه الملف فعليًا على القرص:
+        // لو المستخدم اختار نوع المستند وقت الرفع (زي "صحيفة دعوى"، "مذكرة
+        // دفاع"، "حكم"...) يبقى ده اسمه بدل اسم الملف الأصلي (زي scan001.pdf)
+        const cleanDocType = docType ? sanitizeName(docType.replace(new RegExp(originalExt.replace('.', '\\.') + '$', 'i'), '')) : '';
+        const baseName = cleanDocType || sanitizeName(path.basename(filename, originalExt)) || 'مستند';
+
+        // لو في مستند بنفس الاسم ده مسجل قبل كده لنفس القضية (مثلاً اتنين
+        // "مذكرة دفاع")، أو حتى لو في ملف بنفس الاسم فعليًا على القرص، نضيف
+        // رقم تسلسلي عشان الاسم يفضل مميز ومايحصلش تعارض أو استبدال لملف قديم
+        const index = readIndex();
+        if (!index[caseId]) index[caseId] = [];
+
+        let displayName = `${baseName}${originalExt}`;
+        let counter = 2;
+        while (
+            index[caseId].some(f => (f.originalName || '').toLowerCase() === displayName.toLowerCase()) ||
+            fs.existsSync(path.join(caseFolder, displayName))
+        ) {
+            displayName = `${baseName} (${counter})${originalExt}`;
+            counter++;
+        }
+
+        const storedFileName = displayName;
+        const fullPath = path.join(caseFolder, storedFileName);
+
+        fs.writeFileSync(fullPath, Buffer.from(dataBase64, 'base64'));
+
+        index[caseId].push({
+            id,
+            originalName: displayName,
+            storedFileName,
+            type: docType || '',
+            uploadedAt: Date.now(),
+            caseData: caseData || null
+        });
+        writeIndex(index);
+
+        // نرجّع معرّف الملف واسمه (إضافة غير مُخلّة بالسلوك القديم) ليتمكن الكود من فتح الملف مباشرة بعد إنشائه
+        return { success: true, id, name: displayName };
+    } catch (e) {
+        console.error('saveFile error:', e);
+        return { success: false, error: e.message };
+    }
+});
+
+ipcMain.handle('listFiles', async (event, { caseId }) => {
+    try {
+        const index = readIndex();
+        const files = (index[caseId] || [])
+            .map(f => ({ id: f.id, originalName: f.originalName, type: f.type, uploadedAt: f.uploadedAt }))
+            .sort((a, b) => (a.uploadedAt || 0) - (b.uploadedAt || 0));
+        return { success: true, files };
+    } catch (e) {
+        console.error('listFiles error:', e);
+        return { success: false, files: [] };
+    }
+});
+
+function findEntry(caseId, id) {
+    const index = readIndex();
+    const list = index[caseId] || [];
+    const entry = list.find(f => f.id === id);
+    return { index, list, entry };
+}
+
+ipcMain.handle('readFile', async (event, { caseId, id }) => {
+    try {
+        const { entry } = findEntry(caseId, id);
+        if (!entry) return { success: false, error: 'الملف غير موجود' };
+        const fullPath = path.join(getCaseFolderPath(caseId), entry.storedFileName);
+        if (!fs.existsSync(fullPath)) return { success: false, error: 'الملف غير موجود على القرص' };
+        const buffer = fs.readFileSync(fullPath);
+        return {
+            success: true,
+            mime: guessMimeType(entry.originalName),
+            dataBase64: buffer.toString('base64'),
+            name: entry.originalName
+        };
+    } catch (e) {
+        console.error('readFile error:', e);
+        return { success: false, error: e.message };
+    }
+});
+
+// بيرجع رابط (file://) بيشاور على الملف الأصلي على القرص مباشرة، بدل ما
+// نحوّله لنص Base64 طويل وندسّه في رابط data: — لأن الملفات الكبيرة
+// (زي مستندات PDF كبيرة) بتخلي رابط الـ data: يتجاوز الحد الأقصى لطول
+// الروابط اللي المتصفح بيقبله، فيفشل العرض بصمت وتفضل الشاشة بيضاء.
+ipcMain.handle('getFileUrl', async (event, { caseId, id }) => {
+    try {
+        const { entry } = findEntry(caseId, id);
+        if (!entry) return { success: false, error: 'الملف غير موجود' };
+        const fullPath = path.join(getCaseFolderPath(caseId), entry.storedFileName);
+        if (!fs.existsSync(fullPath)) return { success: false, error: 'الملف غير موجود على القرص' };
+        return {
+            success: true,
+            url: pathToFileURL(fullPath).href,
+            mime: guessMimeType(entry.originalName),
+            name: entry.originalName
+        };
+    } catch (e) {
+        console.error('getFileUrl error:', e);
+        return { success: false, error: e.message };
+    }
+});
+
+ipcMain.handle('deleteFile', async (event, { caseId, id }) => {
+    try {
+        const { index, list, entry } = findEntry(caseId, id);
+        if (!entry) return { success: false, error: 'الملف غير موجود' };
+        const fullPath = path.join(getCaseFolderPath(caseId), entry.storedFileName);
+        try { if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath); } catch (e) { /* تجاهل لو الملف اتنقل يدويًا */ }
+        index[caseId] = list.filter(f => f.id !== id);
+        writeIndex(index);
+        return { success: true };
+    } catch (e) {
+        console.error('deleteFile error:', e);
+        return { success: false, error: e.message };
+    }
+});
+
+ipcMain.handle('downloadFile', async (event, { caseId, id }) => {
+    try {
+        const { entry } = findEntry(caseId, id);
+        if (!entry) return { success: false, error: 'الملف غير موجود' };
+        const fullPath = path.join(getCaseFolderPath(caseId), entry.storedFileName);
+        if (!fs.existsSync(fullPath)) return { success: false, error: 'الملف غير موجود على القرص' };
+
+        const { canceled, filePath } = await dialog.showSaveDialog(mainWindow, {
+            title: 'حفظ المستند',
+            defaultPath: entry.originalName
+        });
+        if (canceled || !filePath) return { success: false, error: 'cancelled' };
+
+        fs.copyFileSync(fullPath, filePath);
+        return { success: true };
+    } catch (e) {
+        console.error('downloadFile error:', e);
+        return { success: false, error: e.message };
+    }
+});
+
+ipcMain.handle('openFileNative', async (event, { caseId, id }) => {
+    try {
+        const { entry } = findEntry(caseId, id);
+        if (!entry) return { success: false, error: 'الملف غير موجود' };
+        const fullPath = path.join(getCaseFolderPath(caseId), entry.storedFileName);
+        if (!fs.existsSync(fullPath)) return { success: false, error: 'الملف غير موجود على القرص' };
+        const result = await shell.openPath(fullPath);
+        if (result) return { success: false, error: result };
+        return { success: true };
+    } catch (e) {
+        console.error('openFileNative error:', e);
+        return { success: false, error: e.message };
+    }
+});
+
+// بيفتح ملف PDF تحديدًا بمتصفح كروم (أو المتصفح الافتراضي للجهاز لو
+// كروم مش متثبت)، بدل ما يتفتح جوه نافذة البرنامج نفسه.
+ipcMain.handle('openPdfInBrowser', async (event, { caseId, id }) => {
+    try {
+        const { entry } = findEntry(caseId, id);
+        if (!entry) return { success: false, error: 'الملف غير موجود' };
+        const fullPath = path.join(getCaseFolderPath(caseId), entry.storedFileName);
+        if (!fs.existsSync(fullPath)) return { success: false, error: 'الملف غير موجود على القرص' };
+        const ok = await openFileInBrowser(fullPath);
+        if (!ok) return { success: false, error: 'تعذر فتح المتصفح' };
+        return { success: true };
+    } catch (e) {
+        console.error('openPdfInBrowser error:', e);
+        return { success: false, error: e.message };
+    }
+});
+
+// تصدير تقرير إحصائيات لوحة التحكم إلى ملف PDF حقيقي باستخدام محرك الطباعة المدمج في Electron
+// (الصفحة تُحمَّل في نافذة مخفية بنفس خط/تنسيق التقرير المطبوع، ثم تُحوَّل مباشرة إلى PDF)
+ipcMain.handle('exportHtmlToPdf', async (event, { html, defaultFileName }) => {
+    let pdfWindow = null;
+    let tempHtmlPath = null;
+    try {
+        const { canceled, filePath } = await dialog.showSaveDialog(mainWindow, {
+            title: 'تصدير الإحصائيات إلى PDF',
+            defaultPath: defaultFileName || 'تقرير-لوحة-التحكم.pdf',
+            filters: [{ name: 'PDF', extensions: ['pdf'] }]
+        });
+        if (canceled || !filePath) return { success: false, error: 'cancelled' };
+
+        tempHtmlPath = path.join(app.getPath('temp'), `dashboard-export-${Date.now()}-${Math.random().toString(36).slice(2)}.html`);
+        fs.writeFileSync(tempHtmlPath, html, 'utf-8');
+
+        pdfWindow = new BrowserWindow({
+            show: false,
+            webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true }
+        });
+        await pdfWindow.loadURL(pathToFileURL(tempHtmlPath).toString());
+        // مهلة قصيرة لضمان اكتمال رسم الرسوم البيانية (المضمّنة كصور) والخطوط قبل التصدير
+        await new Promise(resolve => setTimeout(resolve, 350));
+
+        const pdfBuffer = await pdfWindow.webContents.printToPDF({
+            printBackground: true,
+            preferCSSPageSize: true,
+            landscape: false
+        });
+        fs.writeFileSync(filePath, pdfBuffer);
+        return { success: true, filePath };
+    } catch (e) {
+        console.error('exportHtmlToPdf error:', e);
+        return { success: false, error: e.message };
+    } finally {
+        if (pdfWindow && !pdfWindow.isDestroyed()) pdfWindow.destroy();
+        if (tempHtmlPath) { try { fs.unlinkSync(tempHtmlPath); } catch (e) {} }
+    }
+});
+
+// ---------------------------------------------------------------
+// قوالب الخطابات — مصمَّمة لتعمل على أي جهاز يُثبَّت عليه البرنامج:
+//  1) القوالب مخزَّنة داخل البرنامج بأسماء إنجليزية (letter-01.docx ...) فلا تتأثر بترميز الأسماء العربية
+//     أثناء الضغط/النسخ/التثبيت على أجهزة بإعدادات لغة مختلفة.
+//  2) البحث عن القالب يتجاهل اختلاف كتابة الهمزات والتشكيل والترميز (إ/أ/ا ...).
+//  3) يوجد نسخة مدمجة احتياطية داخل كود الواجهة (app/letter-templates) تُستخدم تلقائيًا إن تعذر
+//     العثور على الملف لأي سبب، فلا تظهر رسالة "القالب غير موجود".
+// ترتيب أماكن البحث: مجلد templates داخل بيانات المستخدم (لتبديل قالب يدويًا) ثم القوالب المثبّتة مع البرنامج.
+// ---------------------------------------------------------------
+const LETTER_TEMPLATE_NAMES = ["إخطار", "استعجال", "شطب", "حكم قطعي", "حكم خبير", "حكم استجواب", "حكم إحالة للتحقيق", "قسم النقض", "حكم إعادة للمرافعة", "حكم وقف تعليقي", "حكم وقف جزائي", "تجديد من الشطب", "تعجيل من الوقف"];
+function templateKey(s) {
+    return String(s || '').normalize('NFKC')
+        .replace(/[\u064B-\u065F\u0670\u0640]/g, '')
+        .replace(/[أإآٱ]/g, 'ا').replace(/ى/g, 'ي')
+        .replace(/\.docx$/i, '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+const TEMPLATE_ALIAS_BY_KEY = {};
+LETTER_TEMPLATE_NAMES.forEach((n, i) => { TEMPLATE_ALIAS_BY_KEY[templateKey(n)] = 'letter-' + String(i + 1).padStart(2, '0') + '.docx'; });
+
+function templateSearchDirs() {
+    const dirs = [];
+    try { dirs.push(path.join(app.getPath('userData'), 'templates')); } catch (e) {}
+    dirs.push(path.join(__dirname, 'app', 'templates'));
+    try { if (process.resourcesPath) dirs.push(path.join(process.resourcesPath, 'app.asar.unpacked', 'app', 'templates')); } catch (e) {}
+    try { if (process.resourcesPath) dirs.push(path.join(process.resourcesPath, 'templates')); } catch (e) {}
+    return dirs;
+}
+function findTemplateFile(requestedName) {
+    const wantedKey = templateKey(requestedName);
+    const alias = TEMPLATE_ALIAS_BY_KEY[wantedKey];
+    for (const d of templateSearchDirs()) {
+        try {
+            if (!fs.existsSync(d)) continue;
+            // (أ) الاسم كما هو، ثم (ب) الاسم الإنجليزي المقابل
+            for (const n of [requestedName, alias]) {
+                if (!n) continue;
+                const f = path.join(d, n);
+                if (fs.existsSync(f) && fs.statSync(f).isFile()) return f;
+            }
+            // (ج) مطابقة مرنة لأسماء الملفات الموجودة فعلًا في المجلد
+            for (const n of fs.readdirSync(d)) {
+                if (/\.docx$/i.test(n) && templateKey(n) === wantedKey) {
+                    const f = path.join(d, n);
+                    if (fs.statSync(f).isFile()) return f;
+                }
+            }
+        } catch (e) { /* جرّب المكان التالي */ }
+    }
+    return null;
+}
+// فحص عند كل تشغيل: إن وُجد نقص نكتب تفاصيله في السجل (الواجهة تستعمل النسخة المدمجة تلقائيًا فلا يتأثر المستخدم)
+app.whenReady().then(() => {
+    try {
+        const missing = LETTER_TEMPLATE_NAMES.filter(n => !findTemplateFile(n + '.docx'));
+        if (missing.length) {
+            console.warn('تنبيه: ملفات قوالب غير موجودة على القرص (ستُستخدم النسخة المدمجة):', missing.join(', '));
+            console.warn('أماكن البحث:', templateSearchDirs().join(' | '));
+        }
+    } catch (e) { console.warn('تعذر فحص قوالب الخطابات:', e.message); }
+});
+
+// قراءة قالب Word من مجلد app/templates (قراءة فقط — القالب الأصلي لا يُعدَّل أبدًا؛
+// كل خطاب يُنشأ كنسخة جديدة من القالب داخل index.html)
+ipcMain.handle('readTemplate', async (event, { name } = {}) => {
+    try {
+        const safe = path.basename(String(name || ''));
+        if (!safe || !/\.docx$/i.test(safe)) return { success: false, error: 'اسم قالب غير صالح' };
+        const full = findTemplateFile(safe);
+        if (!full) return { success: false, error: 'template-not-found', tried: templateSearchDirs() };
+        const buf = fs.readFileSync(full);
+        return { success: true, dataBase64: buf.toString('base64'), name: safe };
+    } catch (e) {
+        console.error('readTemplate error:', e);
+        return { success: false, error: e.message };
+    }
+});
+
+// ---------------------------------------------------------------
+// مسودات الخطابات (مؤقتة): لا تُسجَّل في البرنامج ولا في ملفات القضية.
+// تُكتب في مجلد مؤقت ليفتحها المستخدم في Word ويعدّلها، ولا تُحفظ نهائيًا
+// إلا عندما يختار المستخدم "حفظ الخطاب على الجهاز" (نافذة حفظ باسم).
+// ---------------------------------------------------------------
+const LETTER_DRAFTS_DIR = path.join(app.getPath('temp'), 'case-manager-letter-drafts');
+const letterDrafts = new Map(); // draftId -> المسار الكامل لملف المسودة
+
+function cleanLetterDrafts(maxAgeMs) {
+    try {
+        if (!fs.existsSync(LETTER_DRAFTS_DIR)) return;
+        const now = Date.now();
+        fs.readdirSync(LETTER_DRAFTS_DIR).forEach(name => {
+            const dir = path.join(LETTER_DRAFTS_DIR, name);
+            try {
+                const st = fs.statSync(dir);
+                if (maxAgeMs === 0 || now - st.mtimeMs > maxAgeMs) fs.rmSync(dir, { recursive: true, force: true });
+            } catch (e) { /* ملف مفتوح في Word حاليًا: نتجاهله وسيُحذف لاحقًا */ }
+        });
+    } catch (e) { /* تجاهل */ }
+}
+function letterDraftPath(draftId) {
+    const id = String(draftId || '');
+    if (!/^[A-Za-z0-9_-]+$/.test(id)) return null;
+    const known = letterDrafts.get(id);
+    return known && fs.existsSync(known) ? known : null;
+}
+
+ipcMain.handle('letterDraftWrite', async (event, { dataBase64, filename } = {}) => {
+    try {
+        if (!dataBase64) return { success: false, error: 'لا توجد بيانات للمسودة' };
+        const id = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const dir = path.join(LETTER_DRAFTS_DIR, id);
+        fs.mkdirSync(dir, { recursive: true });
+        const base = sanitizeName(String(filename || 'خطاب').replace(/\.docx$/i, '')) || 'خطاب';
+        const full = path.join(dir, `${base}.docx`);
+        fs.writeFileSync(full, Buffer.from(dataBase64, 'base64'));
+        letterDrafts.set(id, full);
+        return { success: true, draftId: id, name: path.basename(full) };
+    } catch (e) {
+        console.error('letterDraftWrite error:', e);
+        return { success: false, error: e.message };
+    }
+});
+
+ipcMain.handle('letterDraftOpen', async (event, { draftId } = {}) => {
+    try {
+        const full = letterDraftPath(draftId);
+        if (!full) return { success: false, error: 'المسودة غير موجودة (ربما أُغلق البرنامج). أنشئ الخطاب من جديد.' };
+        const result = await shell.openPath(full);
+        if (result) return { success: false, error: result };
+        return { success: true };
+    } catch (e) {
+        console.error('letterDraftOpen error:', e);
+        return { success: false, error: e.message };
+    }
+});
+
+// قراءة آخر نسخة من المسودة بعد تعديلها وحفظها في Word (لتحديث المعاينة)
+ipcMain.handle('letterDraftRead', async (event, { draftId } = {}) => {
+    try {
+        const full = letterDraftPath(draftId);
+        if (!full) return { success: false, error: 'المسودة غير موجودة' };
+        return { success: true, dataBase64: fs.readFileSync(full).toString('base64'), name: path.basename(full) };
+    } catch (e) {
+        console.error('letterDraftRead error:', e);
+        return { success: false, error: e.message };
+    }
+});
+
+// "حفظ الخطاب على الجهاز": نافذة حفظ باسم يختار منها المستخدم المكان والاسم، وتُنسخ آخر نسخة معدّلة من المسودة
+ipcMain.handle('letterDraftSaveAs', async (event, { draftId, dataBase64, filename } = {}) => {
+    try {
+        const draft = letterDraftPath(draftId);
+        const base = sanitizeName(String(filename || (draft ? path.basename(draft) : 'خطاب')).replace(/\.docx$/i, '')) || 'خطاب';
+        const { canceled, filePath } = await dialog.showSaveDialog(mainWindow, {
+            title: 'حفظ الخطاب على الجهاز',
+            defaultPath: path.join(app.getPath('documents'), `${base}.docx`),
+            filters: [{ name: 'مستند Word', extensions: ['docx'] }]
+        });
+        if (canceled || !filePath) return { success: false, error: 'cancelled' };
+        if (draft) fs.copyFileSync(draft, filePath);
+        else if (dataBase64) fs.writeFileSync(filePath, Buffer.from(dataBase64, 'base64'));
+        else return { success: false, error: 'المسودة غير موجودة' };
+        return { success: true, filePath };
+    } catch (e) {
+        console.error('letterDraftSaveAs error:', e);
+        return { success: false, error: e.message };
+    }
+});
+
+app.on('before-quit', () => cleanLetterDrafts(0));
+app.whenReady().then(() => cleanLetterDrafts(24 * 60 * 60 * 1000));
+
+ipcMain.handle('chooseStorageFolder', async () => {
+    try {
+        const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
+            title: 'اختر مجلد تخزين المستندات',
+            properties: ['openDirectory', 'createDirectory']
+        });
+        if (canceled || !filePaths || !filePaths[0]) return { success: false, error: 'cancelled' };
+
+        const chosen = filePaths[0];
+        const cfg = readConfig();
+        writeConfig({ ...cfg, storageFolder: chosen });
+        return { success: true, path: chosen };
+    } catch (e) {
+        console.error('chooseStorageFolder error:', e);
+        return { success: false, error: e.message };
+    }
+});
+
+ipcMain.handle('getStoragePath', async () => {
+    try {
+        return { success: true, path: getStorageFolder() };
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+});
+
+ipcMain.handle('readClipboard', async () => {
+    try {
+        return { success: true, text: clipboard.readText() };
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+});
+
+ipcMain.handle('writeClipboard', async (event, { text }) => {
+    try {
+        clipboard.writeText(text || '');
+        return { success: true };
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+});
+
+// ---------------------------------------------------------------
+// بعض الملفات مش مستندات قضية حقيقية، دي ملفات نظام داخلية (فهارس
+// بيانات، إعدادات...) لازم نستبعدها من الاستيراد عشان متتحسبش كأنها
+// مستند حقيقي.
+const NON_DOCUMENT_FILENAMES = new Set([
+    'documents-index.json',
+    'case-folders-index.json',
+    'config.json',
+    'index.json',
+    'thumbs.db',
+    'desktop.ini',
+    '.ds_store'
+]);
+
+function isImportableDocument(filename) {
+    return !NON_DOCUMENT_FILENAMES.has(String(filename).toLowerCase());
+}
+
+// مسح مجلد التخزين واستيراد المستندات الموجودة بالفعل (اللي كانت
+// مرفوعة يدويًا قبل كده) ومطابقتها مع القضايا المسجلة في البرنامج
+// ---------------------------------------------------------------
+
+// بيرجع قائمة بكل المجلدات الفرعية الموجودة داخل مجلد التخزين، مع محاولة
+// استخراج رقم وسنة الدعوى من أول التسمية (بافتراض الصيغة: "رقم_سنة_...")
+ipcMain.handle('scanStorageFolders', async () => {
+    try {
+        const storageFolder = getStorageFolder();
+        const entries = fs.readdirSync(storageFolder, { withFileTypes: true })
+            .filter(e => e.isDirectory());
+
+        const folders = entries.map(dirEntry => {
+            const folderName = dirEntry.name;
+            const folderPath = path.join(storageFolder, folderName);
+            let files = [];
+            try {
+                files = fs.readdirSync(folderPath, { withFileTypes: true })
+                    .filter(f => f.isFile() && isImportableDocument(f.name))
+                    .map(f => {
+                        let size = 0, mtime = 0;
+                        try {
+                            const stat = fs.statSync(path.join(folderPath, f.name));
+                            size = stat.size;
+                            mtime = stat.mtimeMs;
+                        } catch (e) { /* تجاهل */ }
+                        return { name: f.name, size, mtime };
+                    });
+            } catch (e) { /* تجاهل مجلد يتعذر قراءته */ }
+
+            // محاولة استخراج "رقم_سنة" من أول التسمية
+            let number = '';
+            let year = '';
+            const m = folderName.match(/^(\d+)[_\-\s]+(\d{4})(?:[_\-\s]|$)/);
+            if (m) {
+                number = m[1];
+                year = m[2];
+            }
+
+            return { folderName, number, year, files };
+        });
+
+        return { success: true, folders };
+    } catch (e) {
+        console.error('scanStorageFolders error:', e);
+        return { success: false, error: e.message, folders: [] };
+    }
+});
+
+// بيربط مجلد موجود بالفعل على القرص بقضية معينة (caseId)، وبيسجل كل
+// الملفات الموجودة جواه في فهرس المستندات الخاص بالقضية دي، من غير ما
+// ينقل أو ينسخ أي ملف فعليًا (الملفات فضلة في مكانها بالظبط).
+ipcMain.handle('importCaseFolder', async (event, { caseId, folderName }) => {
+    try {
+        if (!caseId || !folderName) {
+            return { success: false, error: 'بيانات ناقصة للاستيراد' };
+        }
+        const storageFolder = getStorageFolder();
+        const folderPath = path.join(storageFolder, folderName);
+        if (!fs.existsSync(folderPath)) {
+            return { success: false, error: 'المجلد غير موجود على القرص' };
+        }
+
+        const mapping = readCaseFoldersIndex();
+        const existingFolderName = mapping[caseId];
+
+        // لو القضية دي أصلاً ليها مجلد مخصص ومختلف عن المجلد اللي بنستورده،
+        // منستبدلوش خالص (وإلا هنفقد إمكانية الوصول للمستندات القديمة اللي
+        // فهرسها لسه بيشاور على المجلد القديم). بدل كده بننقل كل ملفات
+        // المجلد الجديد لجوه المجلد الأصلي بتاع القضية، عشان يفضل مجلد
+        // واحد بس لكل قضية طول عمرها، فيه كل مستنداتها من غير تكرار.
+        let effectiveFolderName = folderName;
+        if (existingFolderName && existingFolderName !== folderName) {
+            mergeFolderInto(storageFolder, folderName, existingFolderName, caseId);
+            effectiveFolderName = existingFolderName;
+        } else if (!existingFolderName) {
+            // القضية معهاش مجلد متسجل قبل كده؛ اربطها بالمجلد ده بشكل دائم
+            // عشان أي مستند جديد يتضاف بعد كده يروح لنفس المجلد ده بالظبط
+            mapping[caseId] = folderName;
+            writeCaseFoldersIndex(mapping);
+        }
+
+        const effectiveFolderPath = path.join(storageFolder, effectiveFolderName);
+        const files = fs.readdirSync(effectiveFolderPath, { withFileTypes: true })
+            .filter(f => f.isFile() && isImportableDocument(f.name));
+        const index = readIndex();
+        if (!index[caseId]) index[caseId] = [];
+
+        const existingStoredNames = new Set(index[caseId].map(f => f.storedFileName));
+        let addedCount = 0;
+
+        for (const f of files) {
+            if (existingStoredNames.has(f.name)) continue; // متسجل بالفعل، تجاهله عشان ميتكررش
+            let mtime = Date.now();
+            try {
+                mtime = fs.statSync(path.join(effectiveFolderPath, f.name)).mtimeMs;
+            } catch (e) { /* تجاهل */ }
+
+            index[caseId].push({
+                id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+                originalName: f.name,
+                storedFileName: f.name,
+                type: 'مستند مستورد',
+                uploadedAt: mtime,
+                caseData: null
+            });
+            addedCount++;
+        }
+
+        writeIndex(index);
+        return { success: true, addedCount, totalFilesInFolder: files.length };
+    } catch (e) {
+        console.error('importCaseFolder error:', e);
+        return { success: false, error: e.message };
+    }
+});
